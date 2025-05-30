@@ -1,0 +1,338 @@
+// Test of a building a mesh for the 3D poisson pb
+load "msh3"
+load "medit"
+// include "ffmatlib.idp" -> download package to use it to export results into matlab
+verbosity=0;
+
+cout.precision(5);
+macro pow2(k) (k)*(k) //
+macro pow3(k) (k)*(k)*(k) //
+
+// (5) -> problem was that I mixed up P1 and P2 for functionnal variables and it was quite messy
+//		  That was'nt speciefied
+
+// (6) check : mass conservation
+
+// for step 2
+int i,j,k;
+real al,bX,bY,b2;
+real lambda,p,q,theta,Delta,sqrtDelta;
+real cbar,Vi;
+
+// ALG2-JKO param
+real tau = 1e-2;
+int nbSteps = 10;
+real Tf = nbSteps*tau;
+real r = 0.9;
+real r1 = 1./r;		// warning : inverse of r -> will be often used 
+real rhoMax = 1;
+int nIterMaxJKO = 300;
+real epsJKO = 2.e-3; // Put 1.e-4 for a convergence test (long)
+int itJKO; 
+real gap2,gap3,oldGap,criterion;
+matrix Presidual(nbSteps,nIterMaxJKO);  // stores Primal residual error (stop criterion)
+real[int] T1(nIterMaxJKO); 	      T1 = 0.;		  // stores step 1 total execution times
+real[int] T1Poisson(nIterMaxJKO); T1Poisson = 0.; // stores Poisson resolution in step 1 execution times
+real[int] T1proj(nIterMaxJKO);    T1proj = 0.;    // stores projection at the end of step 1 execution times
+real[int] T2(nIterMaxJKO); 	  	  T2 = 0.;		  // stores step 2 total execution times
+real[int] T2ab(nIterMaxJKO); 	  T2ab = 0.;	  // stores step 2 (a,b)-projection onto K execution times
+real[int] T2c(nIterMaxJKO); 	  T2c = 0.;		  // stores step 2 c minimization execution times
+real t0,t1;
+
+
+// Newton method for c update in 2nd step
+int nIterNewton = 500;
+real epsNewton = 1e-8;
+func real fNewton(real ci, real cbar, real Vi)
+{
+	return (ci + r1*exp(ci/tau-Vi-1) - cbar);
+}
+func real fPrimeNewton(real ci, real Vi)
+{
+	return (1 + r1/tau*exp(ci/tau-Vi-1));
+}
+
+func real rootNewton(real c0, real cbar, real Vi)
+{
+	int it = 0;
+	real ci = c0;
+	real fc = fNewton(ci,cbar,Vi);
+	while (abs(fc) > epsNewton && it < nIterNewton){
+		ci = ci - fc/fPrimeNewton(ci,Vi);
+		fc = fNewton(ci,cbar,Vi);
+		it++;
+	}
+	if(it == nIterNewton) { cout << "Warning non convergence for Newton : fc = " << fc <<endl;}
+	return ci;
+}
+
+// mesh parameters
+real Xmin = -1; real Xmax = 1; real sizeX = Xmax-Xmin;
+real Ymin = -1; real Ymax = 1; real sizeY = Ymax-Ymin;
+real sizeT = 1;  /// @warning : has to be fixed to 1 ???
+
+int nX = 16;
+int nY = 16;
+int nZ = 8;
+
+// border's labels
+int dOmega = 3;
+int leftTime = 1;
+int rightTime = 2;
+
+// 3D boundary labels
+int[int] labs3 = [dOmega,dOmega,dOmega,dOmega,rightTime,leftTime];
+
+mesh3 Th = cube(nX,nY,nZ,[Xmin+(Xmax-Xmin)*x,Ymin+(Ymax-Ymin)*y,sizeT*z],label = labs3);
+mesh Space = square(nX,nY,[Xmin+(Xmax-Xmin)*x,Ymin+(Ymax-Ymin)*y]); // must be identical to the base of Th
+
+
+fespace Vh2(Th, P2);
+Vh2 phi,v,w;
+
+// σ = (mu,m,muLeft) lagrangian multiplier associated to q = Λφ <=> (a,b,c) = (dt(φ),[dx(φ),dy(φ)],-φ(.,.,1)) 
+fespace Vh1(Th, P1);
+Vh1 mu, mx, my;
+Vh1 a, bx, by;
+Vh1 tmp1, tmp2, tmp3, phi1, dxPhi, dyPhi, dtPhi, dxPhiOld, dyPhiOld, dtPhiOld;
+Vh1 h, err2, err3, test;
+
+fespace Vh1Space(Space,P1);
+Vh1Space muLeft, c;
+Vh1Space g0, g1, cBar;
+
+fespace Vh0(Th, P0);
+Vh0 f,Dtmp,Dfx,Dfy,Dfz;
+
+fespace Vh0Space(Space,P0);
+Vh0Space dVx,dVy;
+
+// Projections (see report 4.1 for explanations)
+varf base(u1,u2) = int3d(Th)(u1*u2);
+varf projx(u1,u2) = int3d(Th) (dx(u1)*u2); 
+varf projy(u1,u2) = int3d(Th) (dy(u1)*u2); 
+varf projz(u1,u2) = int3d(Th) (dz(u1)*u2); 
+
+matrix P21 = base(Vh2,Vh1);
+matrix P11 = base(Vh1,Vh1,solver=sparsesolver); // sparsesolver is supposed to be better in this case
+matrix P00 = base(Vh0,Vh0,solver=sparsesolver); // sparsesolver is supposed to be better in this case
+
+matrix P21x = projx(Vh2,Vh1); 
+matrix P21y = projy(Vh2,Vh1); 
+matrix P21z = projz(Vh2,Vh1); 
+matrix P10x = projx(Vh1,Vh0); 
+matrix P10y = projy(Vh1,Vh0); 
+matrix P10z = projz(Vh1,Vh0); 
+
+
+
+// Test of other problems
+//VhSpace V = 5*(pow2(pow2(x)-0.25)+pow2(x+0.25))*(pow2(y-0.5)+pow2(x));
+//VhSpace rho = 0.5*rhoMax*( (x<=(0.2*Xmax) && x>=(0.2*Xmin)) && (y<=(0.2*Ymax) && y>=(0.2*Ymin)));
+//VhSpace V = 5*(pow2(pow2(x)-0.5)+pow2(y));
+//VhSpace V = 0.1*(exp(4*(pow2(x)+pow2(y)))-0.8);
+//VhSpace V = 5+30*(pow2(x)+pow2(y));
+//VhSpace rho = 0.5*rhoMax*(x<=(Xmin+0.2) || y <= (Ymin+0.2) || y >= (Ymax-0.2) || x >= (Xmax-0.2));
+//Vh1Space rho = 0.5*rhoMax*( (x<=(0.6*Xmin) && x>=(0.8*Xmin)) && (y<=(0.5*Ymax) && y>=(0.5*Ymin)));
+//Vh1Space V = -x;
+
+// Probleme construction
+Vh1Space rho = 0.8*rhoMax*( (x<=(0.2*Xmax) && x>=(0.2*Xmin)) && (y<=(0.2*Ymax) && y>=(0.2*Ymin)));
+Vh1Space V = 30*rhoMax*(pow2(pow2(x)-0.5)+pow2(y));
+
+
+// For -grad(V) illustration (It's ok not to project here)
+dVx = -dx(V);
+dVy = -dy(V);
+
+plot(Space,V,[dVx,dVy],fill=true,wait=true,value=true); // Potentiel and its gradient
+
+//plot(Space,rho,fill=1,value=true,wait=true);
+//plot(Space,V,fill=1,value=1,wait=true);
+
+
+
+plot(Space,rho,fill=1,value=true,wait=true,cmm="T=0 s"); // Initial crowd
+
+
+for(int k=0; k<nbSteps; k++){
+
+	/*============== JKO step ==============*/
+
+	// Initialisation : 
+	mx = 0.; my = 0.;
+	bx = 0.; by = 0.;
+	mu = 0.;
+	muLeft = 0.;
+	a = 0.;
+	c = 0.;
+
+	itJKO = 0;
+	criterion = epsJKO+1;
+
+	while(itJKO < nIterMaxJKO && criterion > epsJKO ){
+
+		/*--------------- STEP 1 ---------------*/
+
+		t0 = clock();
+
+
+		tmp1 = r1*mx - bx;
+		tmp2 = r1*my - by;
+		tmp3 = r1*mu - a;
+
+		Dtmp[] = P10x*tmp1[];
+		Dfx[] = P00^-1*Dtmp[];
+		Dtmp[] = P10y*tmp2[];
+		Dfy[] = P00^-1*Dtmp[];
+		Dtmp[] = P10z*tmp3[];
+		Dfz[] = P00^-1*Dtmp[];
+
+		f = Dfx + Dfy + Dfz; //f = r1*divXT2(mx,my,mu)-divXT2(bx,by,a); // (6) why it's not the same ?
+		h = (r1*mx - bx)*N.x + (r1*my  -by)*N.y;
+		g0 = r1*(rho - mu(x,y,0)) + a(x,y,0);
+		g1 = r1*(muLeft - mu(x,y,sizeT)) + (a(x,y,sizeT) - c);
+
+		T1proj[itJKO] += clock()-t0; t0 = clock();
+
+		problem Poisson(phi,v)
+			= int3d(Th)(dx(phi)*dx(v)+dy(phi)*dy(v)+dz(phi)*dz(v))
+			- int3d(Th)(f*v)
+			+ int2d(Th,dOmega)(h*v)
+			+ int2d(Th,rightTime)(g0*v)
+			- int2d(Th,leftTime)(g1*v)
+			+ int2d(Th,leftTime)(phi*v);
+		Poisson; // solve 3D poisson problem
+
+		T1Poisson[itJKO] += clock()-t0; t0 = clock();
+		
+		// Differential terms => projection onto P1 (see report 4.1 for explanations)
+		dtPhiOld[] = P21z*phi[];
+		dtPhi[] = P11^-1*dtPhiOld[];
+		dxPhiOld[] = P21x*phi[];
+		dxPhi[] = P11^-1*dxPhiOld[];
+		dyPhiOld[] = P21y*phi[];
+		dyPhi[] = P11^-1*dyPhiOld[];
+		// Projection of φ onto P1 for the operation with c (different than projection for derivation, see report 4.1 for explanations)
+		tmp1[] = P21*phi[];
+		phi1[] = P11^-1*tmp1[];
+
+		T1proj[itJKO] += clock()-t0; 
+
+
+		/*--------------- STEP 2 ---------------*/
+		// Projection on K
+		a = dtPhi+r1*mu;
+		bx = dxPhi+r1*mx;
+		by = dyPhi+r1*my; 
+		t0 = clock();
+		for(i=0; i<Vh1.ndof; i++){
+			
+			al = a[][i];
+			bX = bx[][i];
+			bY = by[][i];
+			b2 = pow2(bX)+pow2(bY);
+			if((al+0.5*b2) > 0){    // i.e. (a,b) not in K
+				p = -1./3*pow2(al+1);
+				q = -2./27*pow3(al+1)-0.5*b2;
+				Delta = 0.25*pow2(q)+pow3(p)/27.;
+				if (Delta > 0){   // only 1 real root
+					sqrtDelta = sqrt(Delta);
+					lambda = pow(-0.5*q+sqrtDelta,1./3)+pow(-0.5*q-sqrtDelta,1./3)+(al-2)/3.;
+					if (isNaN(lambda)){ cout << "\t Nan lambda 1st case" << endl;}
+
+				}
+				else {		     // 3 real roots
+					cout.precision(48);
+					theta = acos(min(1.,max(-1.,1.5*q/p*sqrt(-3./p)))); // (4) need to clap because it was 1.000000000000005435 sometimes
+					lambda = 2*sqrt(-p/3.)*cos(theta/3.) + (al-2)/3.;
+				}
+				a[][i] = al-lambda;
+				bx[][i] = bX/(1.+lambda);
+				by[][i] = bY/(1.+lambda);		
+			}
+		}
+		T2ab[itJKO] += clock()-t0; t0 = clock();
+		// update c
+		cBar = -phi1(x,y,sizeT) + r1*muLeft;
+		for(i=0; i<Vh1Space.ndof; i++){
+			cbar = cBar[][i];
+			Vi = V[][i];
+			if(cbar >= (tau*(1.+Vi)+r1)){
+				c[][i] = cbar-r1;
+			}
+			else{
+				c[][i] = rootNewton(c[][i],cbar,Vi);
+			}
+		}
+		T2c[itJKO] += clock()-t0;
+
+		/*--------------- STEP 3 ---------------*/
+		mu = mu + r*(dtPhi - a);
+		mx = mx + r*(dxPhi - bx);
+		my = my + r*(dyPhi - by);
+		muLeft = muLeft - r*(phi1(x,y,sizeT) + c);
+		
+		
+		/*--------- Optimal condition ----------*/
+
+		///* // Gap for optimal condition criterion
+		err3 = pow2(a-dtPhi) + pow2(bx-dxPhi) + pow2(by-dyPhi);
+		err2 = pow2(c+phi1(x,y,sizeT));		// (2) Projection also
+		gap3 = sqrt(int3d(Th)(err3));
+		gap2 = sqrt(int2d(Th,leftTime)(err2));
+		criterion = gap2+gap3;
+		Presidual(k,itJKO) = criterion;
+		cout << itJKO << ":\t gap = " << criterion << "\t gap3 = " << gap3 << "\t gap2 = " << gap2 <<endl;
+		
+		itJKO++;
+
+		// (3) Test with criterion sk = r*Λ(-Id(qn+1-qn)) ??? 
+	}
+
+
+	cout << "-------------\n["<< k << "] : t = " << k*tau << "\t " << " it_JKO = " << itJKO << " gap = " << criterion << "\n" << endl;
+
+	rho[] = muLeft[]; // recover crowd density at the end of the step
+	plot(Space,rho,fill=1,value=true,wait=true,cmm="T="+k*tau+" s");
+}
+
+T1 = T1Poisson + T1proj;
+T2 = T2ab + T2c;
+
+real sumT1=0,sumT2=0,sumT1proj=0,sumT1Poisson=0,sumT2ab=0,sumT2c=0;
+
+for(i=0;i<nIterMaxJKO;i++){
+	sumT1 += T1[i];
+	sumT2 += T2[i];
+	sumT1proj += T1proj[i];
+	sumT1Poisson += T1Poisson[i];
+	sumT2ab += T2ab[i];
+	sumT2c += T2c[i];
+}
+
+cout << "---------------------- RESULTS --------------------------------------------" << endl;
+cout << "sum step 1 : " << sumT1 << "\n \t derivation / projection : " << sumT1proj << "\n \t 3D Poisson resolution : " << sumT1Poisson << endl;
+cout << "\nsum step 2 : " << sumT2 << "\n \t projection (a,b) -> K :   " << sumT2ab << "\n \t 3D Poisson resolution : " << sumT2c << endl;
+
+
+
+
+
+/*  // -> ne marche pas il faut les transformer pour les ouvrir sur Matlab
+plot(T1,T2, wait=true, cmm="Temps etapes 1 et 2");
+plot(T1proj,T1Poisson, wait=true,cmm="Temps de derivation et de resolution du Poisson 3D pour l'etape 1");
+plot(T2ab,T2c, wait=true, cmm="Temps de projection (a,b)->K et de minimisation c pour  l'etape 2");
+plot(Presidual, wait=true, cmm="Convergence de l'erreur primale vers le critere d'arret pour le premier pas");
+*/
+
+
+//plot(Space,rho,fill=1);
+//plot(Space,muLeft);
+//medit("visu a tau",Th,phi);
+//plot(Space,V,fill = 1);
+//medit("test",Space,rho,wait=true);
+
+//medit("rho at t = tau",Space,rho);
+
+cout << "====================================================\n \t\t\t\t END\n====================================================" << endl;
